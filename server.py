@@ -3,8 +3,10 @@ import logging
 import colorlog
 import argparse
 import os
+import bencodepy
 
 DATA_DIR = "server"
+TORRENT_DIR = "torrents"
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(
@@ -82,8 +84,8 @@ def start_tracker_server(host="0.0.0.0", port=6881):
                 elif data.startswith("LIST_PEERS_FOR_HASH_INFO:"):
                     try:
                         _, info_hash = data.split(":")
-                        peers, file_name, file_size = list_existing_peers(info_hash)
-                        response = f"peers:{peers};name:{file_name};size:{file_size}"
+                        peers, file_name, file_size, hashed_pieces = list_existing_peers(info_hash)
+                        response = f"peers:{peers};name:{file_name};size:{file_size};pieces:{hashed_pieces}"
                         conn.sendall(response.encode("utf-8"))
                     except ValueError:
                         logger.error("Invalid LIST_PEERS_FOR_HASH_INFO request format.")
@@ -105,34 +107,71 @@ def start_tracker_server(host="0.0.0.0", port=6881):
                         logger.error(f"Error processing data: {e}")
 
 def list_existing_peers(info_hash):
-    """List all peers for the specified info_hash."""
+    """List all peers for the specified info_hash and return additional hashed_pieces."""
     try:
-        matching_files = [
+        # find peer file
+        matching_peer_files = [
             f for f in os.listdir(DATA_DIR) if f.startswith(info_hash)
         ]
 
-        if not matching_files:
+        if not matching_peer_files:
             logger.error(f"No files found for info_hash {info_hash}.")
-            return "", "", 0
+            return "", "", 0, ""
+          
+        # find .torrent file
+        matching_torrent_files = [
+            f for f in os.listdir(TORRENT_DIR) if f.startswith(info_hash)
+        ]
+
+        if not matching_torrent_files:
+            logger.error(f"No files found for info_hash {info_hash}.")
+            return "", "", 0, ""
 
         all_peers = []
         file_name = ""
         file_size = 0
-        for file_name in matching_files:
-            file_path = os.path.join(DATA_DIR, file_name)
-            with open(file_path, "r") as file:
+        hashed_pieces = ""
+
+        # Read peers data from the file
+        for file_name in matching_peer_files:
+            peers_file_path = os.path.join(DATA_DIR, file_name)
+            
+            # Read peers data from the file
+            with open(peers_file_path, "r") as file:
                 peers = file.readlines()
                 all_peers.extend(peers)
+
+        # Open and parse the .torrent file
+        for file_name in matching_torrent_files:
+            torrent_file_path = os.path.join(TORRENT_DIR, file_name)
             
-            base_name = os.path.splitext(file_name)[0] 
-            _, file_name, file_size_str = base_name.split(":")
-            file_size = int(file_size_str)
+            with open(torrent_file_path, "rb") as file:
+                torrent_content = file.read()
+                try:
+                    torrent_data = bencodepy.decode(torrent_content)
+                    info = torrent_data.get(b"info", {})
+                    pieces = info.get(b"pieces", b"")
+                    
+                    # Each SHA-1 hash is 20 bytes
+                    hashed_pieces_list = [
+                        pieces[i:i + 20].hex() for i in range(0, len(pieces), 20)
+                    ]
+                    hashed_pieces = ",".join(hashed_pieces_list)
+                    
+                    file_name = info.get(b"name", b"").decode("utf-8")
+                    file_size = info.get(b"length", 0)
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Failed to decode torrent file {torrent_file_path}: {e}")
+                    continue
+            
+        
+
 
         # Return peers as a comma-separated string
-        return ",".join(peer.strip() for peer in all_peers), file_name, file_size
+        return ",".join(peer.strip() for peer in all_peers), file_name, file_size, hashed_pieces
     except Exception as e:
         logger.error(f"Error listing peers for info_hash {info_hash}: {e}")
-        return "", "", 0
+        return "", "", 0, ""
 
 
 def main():

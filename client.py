@@ -25,6 +25,12 @@ FILES_DIR = "files"
 DOWNLOAD_DIR = "downloads"
 PIECE_LENGHT = 512 * 1024
 
+def hash_segment(segment_data):
+    """Calculate the SHA-1 hash of the given segment data."""
+    sha1 = hashlib.sha1()
+    sha1.update(segment_data)
+    return sha1.hexdigest()
+
 
 def compute_info_hash(torrent):
     info = torrent["info"]
@@ -192,14 +198,13 @@ def serve_file_requests(host="0.0.0.0", port=6881):
 
 
 def request_file_metadata(info_hash, tracker_host, tracker_port):
-    """Request file metadata from the tracker for a specific info_hash."""
+    """Request file metadata from the tracker for a specific info_hash"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((tracker_host, tracker_port))
             s.sendall(f"LIST_PEERS_FOR_HASH_INFO:{info_hash}".encode("utf-8"))
             data = s.recv(4096).decode("utf-8")
             logger.info(f"Received metadata for {info_hash}: {data}")
-            print(data)
 
             metadata = {}
             for item in data.split(";"):
@@ -211,8 +216,9 @@ def request_file_metadata(info_hash, tracker_host, tracker_port):
             peers = metadata.get("peers", "").split(",")
             file_name = metadata.get("name", "")
             file_size = int(metadata.get("size", 0))
+            pieces = metadata.get("pieces", "").split(",")
 
-            return peers, file_name, file_size
+            return peers, file_name, file_size, pieces
     except socket.error as e:
         logger.error(f"Error requesting metadata from tracker: {e}")
         return [], "", 0
@@ -223,6 +229,7 @@ def download_file_from_peers(
     file_name,
     file_size,
     peers,
+    pieces,
     piece_length=PIECE_LENGHT,
     max_retries=3
 ):
@@ -238,11 +245,17 @@ def download_file_from_peers(
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
         future_to_segment = {}
 
-        for start, end in segments:
+        for idx, (start, end) in enumerate(segments):
             future = executor.submit(
-                download_segment_with_retry, info_hash, start, end, peers, max_retries
+                download_segment_with_retry_and_verify,
+                info_hash,
+                start,
+                end,
+                peers,
+                max_retries,
+                pieces[idx],
             )
-            future_to_segment[future] = (start, end)  # Corrected mapping
+            future_to_segment[future] = (start, end)
 
         for future in concurrent.futures.as_completed(future_to_segment):
             start, end = future_to_segment[future]
@@ -250,7 +263,7 @@ def download_file_from_peers(
                 segment_data = future.result()
                 if segment_data:
                     file_data[start:end] = segment_data
-                    logger.info(f"Downloaded segment {start}-{end}")
+                    logger.info(f"Segment {start}-{end} downloaded and verified.")
                 else:
                     logger.error(f"Failed to download segment {start}-{end} after retries")
             except Exception as e:
@@ -263,17 +276,23 @@ def download_file_from_peers(
 
 
 
-def download_segment_with_retry(info_hash, start, end, peers, max_retries):
-    """Attempt to download a segment from multiple peers with retries."""
+def download_segment_with_retry_and_verify(info_hash, start, end, peers, max_retries, expected_hash):
+    """Attempt to download a segment from multiple peers with retries and verify its hash."""
     for attempt in range(max_retries):
         for peer in peers:
             try:
-                segment_data = download_segment(peer, info_hash, start, end)
+                segment_data = download_segment(peer, info_hash, start, end)  # Placeholder for actual download logic
                 if segment_data:
-                    logger.info(f"Successfully downloaded segment {start}-{end} from {peer} on attempt {attempt + 1}")
-                    return segment_data
+                    # Verify the segment hash
+                    calculated_hash = hash_segment(segment_data)
+                    if calculated_hash == expected_hash:
+                        logger.info(f"Successfully downloaded and verified segment {start}-{end} from {peer} on attempt {attempt + 1}")
+                        return segment_data
+                    else:
+                        logger.warning(f"Hash mismatch for segment {start}-{end} from {peer} on attempt {attempt + 1}")
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1} failed for segment {start}-{end} from {peer}: {e}")
+    logger.error(f"Failed to download segment {start}-{end} after {max_retries} attempts.")
     return None
 
 def download_segment(peer, info_hash, start, end):
@@ -333,11 +352,11 @@ def main():
         if not args.info_hash:
             logger.error("--info_hash is required for downloading.")
             return
-        peers, file_name, file_size = request_file_metadata(
+        peers, file_name, file_size, pieces = request_file_metadata(
             args.info_hash, tracker_host, tracker_port
         )
 
-        print(peers, file_name, file_size)
+        print(peers, file_name, file_size, pieces) 
         if not file_name or file_size == 0:
             logger.error("Could not determine file metadata.")
             return
@@ -346,7 +365,7 @@ def main():
             logger.error("No peers available for download.")
             return
 
-        download_file_from_peers(args.info_hash, file_name, file_size, peers)
+        download_file_from_peers(args.info_hash, file_name, file_size, peers, pieces)
 
 
 if __name__ == "__main__":
