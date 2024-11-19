@@ -23,6 +23,7 @@ logger.setLevel(logging.DEBUG)
 TORRENT_DIR = "torrents"
 FILES_DIR = "files"
 DOWNLOAD_DIR = "downloads"
+PIECE_LENGHT = 512 * 1024
 
 
 def compute_info_hash(torrent):
@@ -51,7 +52,7 @@ def send_magnet_link_to_tracker(
         logger.error(f"Error sending data to tracker: {e}")
 
 
-def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024):
+def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGHT):
     if not os.path.exists(TORRENT_DIR):
         os.makedirs(TORRENT_DIR)
     with open(file_path, "rb") as f:
@@ -222,7 +223,7 @@ def download_file_from_peers(
     file_name,
     file_size,
     peers,
-    piece_length=512 * 1024,
+    piece_length=PIECE_LENGHT,
     max_retries=3
 ):
     """Download a file from peers by requesting segments concurrently."""
