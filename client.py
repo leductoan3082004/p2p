@@ -6,6 +6,7 @@ import colorlog
 import argparse
 import socket
 import concurrent.futures
+import threading
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(
@@ -23,7 +24,7 @@ logger.setLevel(logging.DEBUG)
 TORRENT_DIR = "torrents"
 FILES_DIR = "files"
 DOWNLOAD_DIR = "downloads"
-PIECE_LENGHT = 512 * 1024
+PIECE_LENGTH = 128 * 1024
 
 def hash_segment(segment_data):
     """Calculate the SHA-1 hash of the given segment data."""
@@ -58,7 +59,7 @@ def send_magnet_link_to_tracker(
         logger.error(f"Error sending data to tracker: {e}")
 
 
-def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGHT, peer_port= 6881):
+def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGTH, peer_port= 6881):
     if not os.path.exists(TORRENT_DIR):
         os.makedirs(TORRENT_DIR)
     with open(file_path, "rb") as f:
@@ -134,11 +135,10 @@ def request_file_list(tracker_host, tracker_port):
             s.sendall("LIST_FILES".encode("utf-8"))
             data = s.recv(4096).decode("utf-8")
             logger.info("Received file list from tracker:")
-            print(data)
     except socket.error as e:
         logger.error(f"Error requesting file list from tracker: {e}")
 
-
+active_seeding_connections = set()  
 def serve_file_requests(host="0.0.0.0", port=6881):
     """Serve file requests from other peers."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -153,9 +153,21 @@ def serve_file_requests(host="0.0.0.0", port=6881):
                 try:
                     data = conn.recv(1024).decode("utf-8").strip()
                     if not data:
-                        logger.warning(f"cannot receive data from {addr}")
+                        logger.warning(f"Cannot receive data from {addr}")
+                        continue
 
-                    if data.startswith("GET_FILE:"):
+                    # Handle "status" requests
+                    if data == "status":
+                        # Check if the current peer is actively seeding to the requesting peer
+                        if addr in active_seeding_connections:
+                            conn.sendall(b"seeding")
+                            logger.info(f"Responded with 'seeding' to status request from {addr}")
+                        else:
+                            conn.sendall(b"not_seeding")
+                            logger.info(f"Responded with 'not_seeding' to status request from {addr}")
+
+                    # Handle "GET_FILE" requests
+                    elif data.startswith("GET_FILE:"):
                         _, info_hash, start, end = data.split(":")
                         start, end = int(start), int(end)
                         file_path = next(
@@ -172,23 +184,35 @@ def serve_file_requests(host="0.0.0.0", port=6881):
                             # Ensure end does not exceed file size
                             end = min(end, file_size)
 
-                            with open(file_path, "rb") as file:
-                                file.seek(start)
-                                file_data = file.read(end - start)
+                            # Track active seeding connection
+                            active_seeding_connections.add(addr)
 
-                                # Send data in chunks
-                                chunk_size = 4096
-                                for i in range(0, len(file_data), chunk_size):
-                                    try:
-                                        conn.sendall(file_data[i:i + chunk_size])
-                                    except (ConnectionResetError, BrokenPipeError):
-                                        logger.error(f"Connection to {addr} was reset during file transfer.")
-                                        break
+                            try:
+                                with open(file_path, "rb") as file:
+                                    file.seek(start)
+                                    file_data = file.read(end - start)
 
-                            logger.info(f"Served file segment {start}-{end} of {file_path} to {addr}")
+                                    # Send data in chunks
+                                    chunk_size = 4096
+                                    for i in range(0, len(file_data), chunk_size):
+                                        try:
+                                            conn.sendall(file_data[i:i + chunk_size])
+                                        except (ConnectionResetError, BrokenPipeError):
+                                            logger.error(f"Connection to {addr} was reset during file transfer.")
+                                            break
+
+                                logger.info(f"Served file segment {start}-{end} of {file_path} to {addr}")
+                            finally:
+                                # Remove from active seeding connections after transfer
+                                active_seeding_connections.discard(addr)
                         else:
                             logger.error(f"Requested file with hash {info_hash} not found.")
                             conn.sendall(b"ERROR: File not found.")
+
+                    else:
+                        logger.error(f"Invalid request received from {addr}: {data}")
+                        conn.sendall(b"ERROR: Invalid request format.")
+
                 except ValueError as e:
                     logger.error(f"Invalid request format: {data}")
                     conn.sendall(b"ERROR: Invalid request format.")
@@ -229,70 +253,122 @@ def download_file_from_peers(
     file_size,
     peers,
     pieces,
-    piece_length=PIECE_LENGHT,
+    piece_length=PIECE_LENGTH,
     max_retries=3
 ):
-    """Download a file from peers by requesting segments concurrently."""
+    """Download a file from peers by distributing segments in an alternating pattern."""
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
+    # Create segments
     segments = [
         (i, min(i + piece_length, file_size)) for i in range(0, file_size, piece_length)
     ]
     file_data = bytearray(file_size)
+    segment_lock = threading.Lock()
+    completed_segments = set()  # Tracks completed segment indices
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
-        future_to_segment = {}
+    # Distribute segments alternately among peers
+    peer_segments = {peer: [] for peer in peers}
+    for idx, segment in enumerate(segments):
+        assigned_peer = peers[idx % len(peers)]
+        peer_segments[assigned_peer].append(segment)
+        
+    # print(peer_segments)
+    # return
+        
 
-        for idx, (start, end) in enumerate(segments):
-            future = executor.submit(
-                download_segment_with_retry_and_verify,
-                info_hash,
-                start,
-                end,
-                peers,
-                max_retries,
-                pieces[idx],
-            )
-            future_to_segment[future] = (start, end)
 
-        for future in concurrent.futures.as_completed(future_to_segment):
-            start, end = future_to_segment[future]
+    def segment_worker(peer, segments):
+        """Worker for a specific peer to download assigned segments."""
+        nonlocal completed_segments
+        for start, end in segments:
+            idx = start // piece_length
+            with segment_lock:
+                if idx in completed_segments:
+                    continue  # Segment already downloaded
+
             try:
-                segment_data = future.result()
+                # Attempt to download and verify the segment from the assigned peer
+                segment_data = download_segment_with_retry_and_verify(
+                    info_hash, start, end, peer, max_retries=1, expected_hash=pieces[idx]
+                )
                 if segment_data:
-                    file_data[start:end] = segment_data
-                    logger.info(f"Segment {start}-{end} downloaded and verified.")
-                else:
-                    logger.error(f"Failed to download segment {start}-{end} after retries")
+                    with segment_lock:
+                        if idx not in completed_segments:
+                            file_data[start:end] = segment_data
+                            completed_segments.add(idx)
+                            logger.info(f"Segment {start}-{end} downloaded and verified from {peer}.")
             except Exception as e:
-                logger.error(f"Error downloading segment {start}-{end}: {e}")
+                logger.warning(f"Error downloading segment {start}-{end} from {peer}: {e}")
 
+
+    # Start multithreaded downloading
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
+        future_to_peer = {
+            executor.submit(segment_worker, peer, peer_segments[peer]): peer
+            for peer in peers
+        }
+
+        for future in concurrent.futures.as_completed(future_to_peer):
+            peer = future_to_peer[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error in worker for peer {peer}: {e}")
+
+    # Write the downloaded file
     download_path = os.path.join(DOWNLOAD_DIR, file_name)
     with open(download_path, "wb") as f:
         f.write(file_data)
     logger.info(f"File downloaded and saved to {download_path}")
 
 
-
-def download_segment_with_retry_and_verify(info_hash, start, end, peers, max_retries, expected_hash):
+def download_segment_with_retry_and_verify(info_hash, start, end, peer, max_retries, expected_hash):
     """Attempt to download a segment from multiple peers with retries and verify its hash."""
     for attempt in range(max_retries):
-        for peer in peers:
-            try:
-                segment_data = download_segment(peer, info_hash, start, end)  # Placeholder for actual download logic
-                if segment_data:
-                    # Verify the segment hash
-                    calculated_hash = hash_segment(segment_data)
-                    if calculated_hash == expected_hash:
-                        logger.info(f"Successfully downloaded and verified segment {start}-{end} from {peer} on attempt {attempt + 1}")
-                        return segment_data
-                    else:
-                        logger.warning(f"Hash mismatch for segment {start}-{end} from {peer} on attempt {attempt + 1}")
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed for segment {start}-{end} from {peer}: {e}")
-    logger.error(f"Failed to download segment {start}-{end} after {max_retries} attempts.")
-    return None
+        try:
+            segment_data = download_segment(peer, info_hash, start, end)  # Placeholder for actual download logic
+            if segment_data:
+                # Verify the segment hash
+                calculated_hash = hash_segment(segment_data)
+                if calculated_hash == expected_hash:
+                    # logger.info(f"Successfully downloaded and verified segment {start}-{end} from {peer} on attempt {attempt + 1}")
+                    return segment_data
+                else:
+                    logger.warning(f"Hash mismatch for segment {start}-{end} from {peer} on attempt {attempt + 1}")
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed for segment {start}-{end} from {peer}: {e}")
+
+    return None  # If no peer could provide the segment after retries
+  
+  
+def is_peer_seeding_to_current(peer):
+    """
+    Check if a peer is seeding data to the current peer.
+    """
+    try:
+        host, port = peer.split(":")
+        port = int(port)
+
+        with socket.create_connection((host, port), timeout=2) as conn:
+            # Send a status request message
+            status_request_message = "status"
+            conn.sendall(status_request_message.encode('utf-8'))
+
+            # Receive and decode the response
+            response = conn.recv(1024).decode('utf-8').strip()
+
+            # Assuming the peer responds with "seeding" if it is seeding
+            if response.lower() == "seeding":
+                logger.info(f"Peer {peer} is seeding to the current peer.")
+                return True
+            else:
+                logger.info(f"Peer {peer} is not seeding to the current peer.")
+                return False
+    except Exception as e:
+        logger.warning(f"Could not determine seeding status for peer {peer}: {e}")
+        return False
 
 def download_segment(peer, info_hash, start, end):
     """Download a segment of a file from a peer."""
@@ -359,7 +435,7 @@ def main():
             args.info_hash, tracker_host, tracker_port
         )
 
-        print(peers, file_name, file_size, pieces) 
+        # print(peers, file_name, file_size, pieces) 
         if not file_name or file_size == 0:
             logger.error("Could not determine file metadata.")
             return
