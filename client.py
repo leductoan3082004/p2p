@@ -58,7 +58,7 @@ def send_magnet_link_to_tracker(
         logger.error(f"Error sending data to tracker: {e}")
 
 
-def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGHT):
+def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGHT, peer_port= 6881):
     if not os.path.exists(TORRENT_DIR):
         os.makedirs(TORRENT_DIR)
     with open(file_path, "rb") as f:
@@ -88,7 +88,6 @@ def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGHT):
     )
 
     peer_id = socket.gethostname()
-    peer_port = 6881
 
     send_magnet_link_to_tracker(
         info_hash,
@@ -335,19 +334,23 @@ def main():
         "--download", action="store_true", help="Download a file from peers."
     )
     parser.add_argument("--info_hash", help="Info hash of the file to download.")
+    parser.add_argument(
+        "--port", type=int, default=6881, help="Specify the peer port. Default is 6881."
+    )
 
     args = parser.parse_args()
 
     tracker_host, tracker_port = args.tracker.split(":")[1][2:], int(
         args.tracker.split(":")[2].split("/")[0]
     )
+    
 
     if args.list_files:
         request_file_list(tracker_host, tracker_port)
     elif args.file_path:
-        process_torrent_file(args.file_path, args.tracker)
+        process_torrent_file(args.file_path, args.tracker,peer_port=args.port)
     elif args.serve:
-        serve_file_requests()
+        serve_file_requests(port=args.port)
     elif args.download:
         if not args.info_hash:
             logger.error("--info_hash is required for downloading.")
