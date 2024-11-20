@@ -153,7 +153,7 @@ def serve_file_requests(host="0.0.0.0", port=6881):
                 try:
                     data = conn.recv(1024).decode("utf-8").strip()
                     if not data:
-                        break
+                        logger.warning(f"cannot receive data from {addr}")
 
                     if data.startswith("GET_FILE:"):
                         _, info_hash, start, end = data.split(":")
