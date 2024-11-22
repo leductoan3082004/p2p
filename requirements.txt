@@ -1,11 +1,14 @@
 bencodepy==0.9.5
 black==24.10.0
+certifi==2024.8.30
+charset-normalizer==3.4.0
 click==8.1.7
 colorama==0.4.6
 colorlog==6.9.0
 cssbeautifier==1.15.1
 djlint==1.36.1
 EditorConfig==0.12.4
+idna==3.10
 jsbeautifier==1.15.1
 json5==0.9.28
 mypy-extensions==1.0.0
@@ -14,5 +17,7 @@ pathspec==0.12.1
 platformdirs==4.3.6
 PyYAML==6.0.2
 regex==2024.11.6
+requests==2.32.3
 six==1.16.0
 tqdm==4.67.0
+urllib3==2.2.3

@@ -6,6 +6,9 @@ import colorlog
 import argparse
 import socket
 import concurrent.futures
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import requests
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(
@@ -19,10 +22,6 @@ handler.setFormatter(
 logger = colorlog.getLogger()
 logger.addHandler(handler)
 logger.setLevel(logging.DEBUG)
-
-TORRENT_DIR = "torrents"
-FILES_DIR = "files"
-DOWNLOAD_DIR = "downloads"
 
 
 def compute_info_hash(torrent):
@@ -51,19 +50,22 @@ def send_magnet_link_to_tracker(
         logger.error(f"Error sending data to tracker: {e}")
 
 
-def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024):
+def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024, port=8000):
+    TORRENT_DIR = f"torrents_{port}"
+    FILES_DIR = f"files_{port}"
+
     if not os.path.exists(TORRENT_DIR):
         os.makedirs(TORRENT_DIR)
     with open(file_path, "rb") as f:
         file_data = f.read()
 
     pieces = [
-        hashlib.sha1(file_data[i : i + piece_length]).digest()
+        hashlib.sha1(file_data[i: i + piece_length]).digest()
         for i in range(0, len(file_data), piece_length)
     ]
 
     info = {
-        "name": file_path.split("/")[-1],
+        "name": os.path.basename(file_path),
         "length": len(file_data),
         "piece length": piece_length,
         "pieces": b"".join(pieces),
@@ -81,7 +83,7 @@ def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024):
     )
 
     peer_id = socket.gethostname()
-    peer_port = 6881
+    peer_port = port  # Use specified port
 
     send_magnet_link_to_tracker(
         info_hash,
@@ -108,7 +110,7 @@ def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024):
         logger.error(f"File already exists: {new_file_path}")
         return
 
-    torrent_file_name = f"{TORRENT_DIR}/{info_hash}.torrent"
+    torrent_file_name = os.path.join(TORRENT_DIR, f"{info_hash}.torrent")
 
     if os.path.exists(torrent_file_name):
         logger.error(f"File already exists: {torrent_file_name}")
@@ -133,61 +135,71 @@ def request_file_list(tracker_host, tracker_port):
         logger.error(f"Error requesting file list from tracker: {e}")
 
 
-def serve_file_requests(host="0.0.0.0", port=6881):
-    """Serve file requests from other peers."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.bind((host, port))
-        server_socket.listen()
-        logger.info(f"Peer server listening on {host}:{port}")
+class FileRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/get_file":
+            # Read headers
+            info_hash = self.headers.get('Info-Hash')
+            start = int(self.headers.get('Segment-Start', 0))
+            end = int(self.headers.get('Segment-End', 0))
 
-        while True:
-            conn, addr = server_socket.accept()
-            with conn:
-                logger.info(f"Connected by {addr}")
-                try:
-                    data = conn.recv(1024).decode("utf-8").strip()
-                    if not data:
-                        break
+            file_path = next(
+                (
+                    os.path.join(self.server.files_dir, f)
+                    for f in os.listdir(self.server.files_dir)
+                    if f.startswith(info_hash)
+                ),
+                None,
+            )
 
-                    if data.startswith("GET_FILE:"):
-                        _, info_hash, start, end = data.split(":")
-                        start, end = int(start), int(end)
-                        file_path = next(
-                            (
-                                os.path.join(FILES_DIR, f)
-                                for f in os.listdir(FILES_DIR)
-                                if f.startswith(info_hash)
-                            ),
-                            None,
-                        )
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                # Ensure end does not exceed file size
+                end = min(end, file_size)
 
-                        if file_path and os.path.exists(file_path):
-                            file_size = os.path.getsize(file_path)
-                            # Ensure end does not exceed file size
-                            end = min(end, file_size)
+                with open(file_path, "rb") as file:
+                    file.seek(start)
+                    file_data = file.read(end - start)
 
-                            with open(file_path, "rb") as file:
-                                file.seek(start)
-                                file_data = file.read(end - start)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(file_data)))
+                self.end_headers()
+                self.wfile.write(file_data)
+                logger.info(
+                    f"Served file segment {start}-{end} of {file_path} to {self.client_address}"
+                )
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"ERROR: File not found.")
+                logger.error(f"Requested file with hash {info_hash} not found.")
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"ERROR: Invalid request.")
+            logger.error(f"Invalid request path: {self.path}")
 
-                                # Send data in chunks
-                                chunk_size = 4096
-                                for i in range(0, len(file_data), chunk_size):
-                                    try:
-                                        conn.sendall(file_data[i:i + chunk_size])
-                                    except (ConnectionResetError, BrokenPipeError):
-                                        logger.error(f"Connection to {addr} was reset during file transfer.")
-                                        break
 
-                            logger.info(f"Served file segment {start}-{end} of {file_path} to {addr}")
-                        else:
-                            logger.error(f"Requested file with hash {info_hash} not found.")
-                            conn.sendall(b"ERROR: File not found.")
-                except ValueError as e:
-                    logger.error(f"Invalid request format: {data}")
-                    conn.sendall(b"ERROR: Invalid request format.")
-                except (ConnectionResetError, BrokenPipeError):
-                    logger.error(f"Connection to {addr} was reset during file transfer.")
+def serve_file_requests(host="0.0.0.0", port=8000):
+    """Serve file requests from other peers using HTTP."""
+    FILES_DIR = f"files_{port}"
+
+    if not os.path.exists(FILES_DIR):
+        os.makedirs(FILES_DIR)
+
+    server_address = (host, port)
+    handler = FileRequestHandler
+    httpd = HTTPServer(server_address, handler)
+    httpd.files_dir = FILES_DIR  # Pass the files directory to the handler
+    logger.info(f"HTTP server is running on {host}:{port}, serving from {FILES_DIR}")
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
+    logger.info("HTTP server stopped.")
 
 
 def request_file_metadata(info_hash, tracker_host, tracker_port):
@@ -222,10 +234,13 @@ def download_file_from_peers(
     file_name,
     file_size,
     peers,
-    piece_length=512 * 1024,
-    max_retries=3
+    piece_length=30082,
+    max_retries=3,
+    port=8000,
 ):
-    """Download a file from peers by requesting segments concurrently."""
+    """Download a file from peers by requesting segments concurrently using HTTP."""
+    DOWNLOAD_DIR = f"downloads_{port}"
+
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
@@ -234,14 +249,27 @@ def download_file_from_peers(
     ]
     file_data = bytearray(file_size)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
-        future_to_segment = {}
+    # Assign segments to peers evenly
+    segment_peer_map = {}
+    for idx, segment in enumerate(segments):
+        peer = peers[idx % len(peers)]
+        segment_peer_map[segment] = peer
 
-        for start, end in segments:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_segment = {}
+        for segment in segments:
+            start, end = segment
+            assigned_peer = segment_peer_map[segment]
             future = executor.submit(
-                download_segment_with_retry, info_hash, start, end, peers, max_retries
+                download_segment_with_retry,
+                info_hash,
+                start,
+                end,
+                peers,
+                max_retries,
+                assigned_peer=assigned_peer,
             )
-            future_to_segment[future] = (start, end)  # Corrected mapping
+            future_to_segment[future] = (start, end)
 
         for future in concurrent.futures.as_completed(future_to_segment):
             start, end = future_to_segment[future]
@@ -251,7 +279,9 @@ def download_file_from_peers(
                     file_data[start:end] = segment_data
                     logger.info(f"Downloaded segment {start}-{end}")
                 else:
-                    logger.error(f"Failed to download segment {start}-{end} after retries")
+                    logger.error(
+                        f"Failed to download segment {start}-{end} after retries"
+                    )
             except Exception as e:
                 logger.error(f"Error downloading segment {start}-{end}: {e}")
 
@@ -261,42 +291,60 @@ def download_file_from_peers(
     logger.info(f"File downloaded and saved to {download_path}")
 
 
-
-def download_segment_with_retry(info_hash, start, end, peers, max_retries):
-    """Attempt to download a segment from multiple peers with retries."""
-    for attempt in range(max_retries):
-        for peer in peers:
+def download_segment_with_retry(info_hash, start, end, peers, max_retries, assigned_peer=None):
+    """Attempt to download a segment from peers with retries, starting with assigned_peer."""
+    # Start with assigned peer, then try others if necessary
+    peers_to_try = [assigned_peer] + [peer for peer in peers if peer != assigned_peer]
+    for peer in peers_to_try:
+        for attempt in range(max_retries):
             try:
                 segment_data = download_segment(peer, info_hash, start, end)
                 if segment_data:
-                    logger.info(f"Successfully downloaded segment {start}-{end} from {peer} on attempt {attempt + 1}")
+                    logger.info(
+                        f"Successfully downloaded segment {start}-{end} from {peer} on attempt {attempt + 1}"
+                    )
                     return segment_data
+                else:
+                    logger.warning(
+                        f"No data received for segment {start}-{end} from {peer} on attempt {attempt + 1}"
+                    )
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed for segment {start}-{end} from {peer}: {e}")
+                logger.error(
+                    f"Error on attempt {attempt + 1} for segment {start}-{end} from {peer}: {e}"
+                )
+        logger.warning(
+            f"Failed to download segment {start}-{end} from {peer} after {max_retries} attempts"
+        )
     return None
 
+
 def download_segment(peer, info_hash, start, end):
-    """Download a segment of a file from a peer."""
+    """Download a segment of a file from a peer using HTTP headers."""
     try:
         peer_host, peer_port = peer.split(":")
-        total_bytes_to_receive = end - start
-        data = bytearray()
+        url = f"http://{peer_host}:{peer_port}/get_file"  # No query parameters
+        headers = {
+            'Info-Hash': info_hash,
+            'Segment-Start': str(start),
+            'Segment-End': str(end)
+        }
+        response = requests.get(url, headers=headers, stream=True, timeout=10)
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((peer_host, int(peer_port)))
-            request = f"GET_FILE:{info_hash}:{start}:{end}"
-            s.sendall(request.encode("utf-8"))
-
-            while len(data) < total_bytes_to_receive:
-                packet = s.recv(4096)
-                if not packet:
-                    # Connection closed prematurely
-                    logger.error(f"Connection closed before receiving all data for segment {start}-{end}")
-                    return None
-                data.extend(packet)
-
-            return bytes(data)
-    except socket.error as e:
+        if response.status_code == 200:
+            data = response.content
+            if len(data) == (end - start):
+                return data
+            else:
+                logger.error(
+                    f"Received incomplete data for segment {start}-{end} from {peer}"
+                )
+                return None
+        else:
+            logger.error(
+                f"Received status code {response.status_code} for segment {start}-{end} from {peer}"
+            )
+            return None
+    except requests.RequestException as e:
         logger.error(f"Error downloading segment from {peer}: {e}")
         return None
 
@@ -315,6 +363,7 @@ def main():
         "--download", action="store_true", help="Download a file from peers."
     )
     parser.add_argument("--info_hash", help="Info hash of the file to download.")
+    parser.add_argument("--port", type=int, help="Port to serve the file on.")
 
     args = parser.parse_args()
 
@@ -322,12 +371,22 @@ def main():
         args.tracker.split(":")[2].split("/")[0]
     )
 
+    port = int(args.port) if args.port else 8000
+
     if args.list_files:
         request_file_list(tracker_host, tracker_port)
     elif args.file_path:
-        process_torrent_file(args.file_path, args.tracker)
+        process_torrent_file(args.file_path, args.tracker, port=port)
     elif args.serve:
-        serve_file_requests()
+        # Run the HTTP server in a separate thread to prevent blocking
+        server_thread = threading.Thread(target=serve_file_requests, args=("0.0.0.0", port,))
+        server_thread.daemon = True
+        server_thread.start()
+        try:
+            while True:
+                pass  # Keep the main thread alive
+        except KeyboardInterrupt:
+            logger.info("Shutting down the server.")
     elif args.download:
         if not args.info_hash:
             logger.error("--info_hash is required for downloading.")
@@ -345,7 +404,7 @@ def main():
             logger.error("No peers available for download.")
             return
 
-        download_file_from_peers(args.info_hash, file_name, file_size, peers)
+        download_file_from_peers(args.info_hash, file_name, file_size, peers, port=port)
 
 
 if __name__ == "__main__":
