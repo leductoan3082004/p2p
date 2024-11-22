@@ -10,6 +10,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import requests
 
+PIECE_LENGTH_FOR_HASH = 512 * 1024
+
 handler = colorlog.StreamHandler()
 handler.setFormatter(
     colorlog.ColoredFormatter(
@@ -37,9 +39,9 @@ def generate_magnet_link(info_hash, tracker_url, file_name):
 
 
 def send_magnet_link_to_tracker(
-    info_hash, peer_id, peer_port, tracker_host, tracker_port, file_name, file_size
+    info_hash, peer_id, peer_port, tracker_host, tracker_port, file_name, file_size, piece_length
 ):
-    message = f"info_hash={info_hash}&peer_id={peer_id}&peer_port={peer_port}&file_name={file_name}&file_size={file_size}"
+    message = f"info_hash={info_hash}&peer_id={peer_id}&peer_port={peer_port}&file_name={file_name}&file_size={file_size}&piece_length={piece_length}"
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -50,7 +52,7 @@ def send_magnet_link_to_tracker(
         logger.error(f"Error sending data to tracker: {e}")
 
 
-def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024, port=8000):
+def process_torrent_file(file_path, tracker_url, piece_length=PIECE_LENGTH_FOR_HASH, port=8000):
     TORRENT_DIR = f"torrents_{port}"
     FILES_DIR = f"files_{port}"
 
@@ -93,6 +95,7 @@ def process_torrent_file(file_path, tracker_url, piece_length=512 * 1024, port=8
         tracker_port,
         info["name"],
         info["length"],
+        piece_length,  # Pass piece_length to the tracker
     )
 
     # Ensure the FILES_DIR exists
@@ -222,11 +225,12 @@ def request_file_metadata(info_hash, tracker_host, tracker_port):
             peers = metadata.get("peers", "").split(",")
             file_name = metadata.get("name", "")
             file_size = int(metadata.get("size", 0))
+            piece_length = int(metadata.get("piece_length", 0))  # Get piece_length
 
-            return peers, file_name, file_size
+            return peers, file_name, file_size, piece_length
     except socket.error as e:
         logger.error(f"Error requesting metadata from tracker: {e}")
-        return [], "", 0
+        return [], "", 0, 0
 
 
 def download_file_from_peers(
@@ -234,7 +238,7 @@ def download_file_from_peers(
     file_name,
     file_size,
     peers,
-    piece_length=30082,
+    piece_length=512 * 1024,  # Default piece length
     max_retries=3,
     port=8000,
 ):
@@ -289,6 +293,39 @@ def download_file_from_peers(
     with open(download_path, "wb") as f:
         f.write(file_data)
     logger.info(f"File downloaded and saved to {download_path}")
+
+    # Validate the downloaded file using the info_hash
+    is_valid = validate_downloaded_file(download_path, info_hash, PIECE_LENGTH_FOR_HASH)
+    if is_valid:
+        logger.info("Downloaded file is valid.")
+    else:
+        logger.error("Downloaded file is invalid. Info hash does not match.")
+
+
+def validate_downloaded_file(file_path, expected_info_hash, piece_length):
+    """Validate the downloaded file by computing its info hash and comparing to expected."""
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    pieces = [
+        hashlib.sha1(file_data[i: i + piece_length]).digest()
+        for i in range(0, len(file_data), piece_length)
+    ]
+
+    info = {
+        "name": os.path.basename(file_path),
+        "length": len(file_data),
+        "piece length": piece_length,
+        "pieces": b"".join(pieces),
+    }
+
+    info_encoded = bencodepy.encode(info)
+    computed_info_hash = hashlib.sha1(info_encoded).hexdigest()
+
+    logger.info(f"Expected InfoHash: {expected_info_hash}")
+    logger.info(f"Computed InfoHash: {computed_info_hash}")
+
+    return expected_info_hash == computed_info_hash
 
 
 def download_segment_with_retry(info_hash, start, end, peers, max_retries, assigned_peer=None):
@@ -391,7 +428,7 @@ def main():
         if not args.info_hash:
             logger.error("--info_hash is required for downloading.")
             return
-        peers, file_name, file_size = request_file_metadata(
+        peers, file_name, file_size, piece_length = request_file_metadata(
             args.info_hash, tracker_host, tracker_port
         )
 
@@ -404,7 +441,15 @@ def main():
             logger.error("No peers available for download.")
             return
 
-        download_file_from_peers(args.info_hash, file_name, file_size, peers, port=port)
+        piece_length = max(piece_length, 512 * 102)
+        download_file_from_peers(
+            args.info_hash,
+            file_name,
+            file_size,
+            peers,
+            piece_length=piece_length,  # Use the same piece_length
+            port=port
+        )
 
 
 if __name__ == "__main__":
