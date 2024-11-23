@@ -241,6 +241,7 @@ def download_file_from_peers(
     piece_length=512 * 1024,  # Default piece length
     max_retries=3,
     port=8000,
+    tracker_url=None  # Add tracker_url as a parameter
 ):
     """Download a file from peers by requesting segments concurrently using HTTP."""
     DOWNLOAD_DIR = f"downloads_{port}"
@@ -298,6 +299,7 @@ def download_file_from_peers(
     is_valid = validate_downloaded_file(download_path, info_hash, PIECE_LENGTH_FOR_HASH)
     if is_valid:
         logger.info("Downloaded file is valid.")
+        process_torrent_file(download_path, tracker_url, port=port)
     else:
         logger.error("Downloaded file is invalid. Info hash does not match.")
 
@@ -447,8 +449,9 @@ def main():
             file_name,
             file_size,
             peers,
-            piece_length=piece_length,  # Use the same piece_length
-            port=port
+            piece_length=piece_length,
+            port=port,
+            tracker_url=args.tracker
         )
 
 
